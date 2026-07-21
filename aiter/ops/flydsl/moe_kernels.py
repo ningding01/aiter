@@ -10,6 +10,7 @@ from typing import Dict, Optional
 
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
@@ -1450,6 +1451,32 @@ def flydsl_moe_stage1(
     return out
 
 
+def _graph_safe_stage2_mode(
+    mode: str,
+    *,
+    gfx: str,
+    capturing: bool,
+    a_dtype: str,
+    b_dtype: str,
+    num_experts: int,
+    model_dim: int,
+    inter_dim: int,
+    topk: int,
+) -> str:
+    is_minimax_m3_mxfp8 = (
+        gfx == "gfx950"
+        and a_dtype == "fp8"
+        and b_dtype == "fp8"
+        and num_experts == 256
+        and model_dim == 6144
+        and inter_dim == 768
+        and topk == 5
+    )
+    if mode != "reduce" and capturing and is_minimax_m3_mxfp8:
+        return "reduce"
+    return mode
+
+
 def flydsl_moe_stage2(
     inter_states: torch.Tensor,
     w2: torch.Tensor,
@@ -1510,8 +1537,21 @@ def flydsl_moe_stage2(
     model_dim = w2.shape[1]
     inter_dim = inter_states.shape[2]
 
-    # Debug: force stage2 to use the masked reduce epilogue instead of atomic
-    # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
+    # The gfx950 MiniMax-M3 MXFP8 atomic stage2 path is not graph-replay safe:
+    # under sustained dynamic batches it can raise an HSA hardware exception.
+    # Keep the tuned FlyDSL GEMMs but use the deterministic per-slot reduction
+    # while capturing; eager execution retains the faster atomic epilogue.
+    mode = _graph_safe_stage2_mode(
+        mode,
+        gfx=get_gfx(),
+        capturing=torch.cuda.is_current_stream_capturing(),
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        num_experts=E,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        topk=topk,
+    )
     if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
         mode = "reduce"
 
