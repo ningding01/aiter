@@ -114,8 +114,15 @@ def _sage_fwd_no_mask(
                 qk += alibi_block
 
             if USE_BIAS:
-                bias_ptrs = bias_base_ptrs + start_n * stride_bn
-                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
+                # delta_s: one value per K position, shared by every Q row
+                # in this block, so the load is 1-D along N.
+                offs_kv = tl.arange(0, BLOCK_N)
+                bias_mask = (start_n + offs_kv) < seqlen_k
+                bias = tl.load(
+                    bias_base_ptrs + (start_n + offs_kv) * stride_bn,
+                    mask=bias_mask,
+                    other=0.0,
+                )[None, :]
                 qk += bias
 
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -309,8 +316,15 @@ def _sage_fwd_blocksparse_nomask(
                 )
                 qk_scaled += alibi_block
             if USE_BIAS:
-                bias_ptrs = bias_base_ptrs + start_n * stride_bn
-                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
+                # delta_s: one value per K position, shared by every Q row
+                # in this block, so the load is 1-D along N.
+                offs_kv = tl.arange(0, BLOCK_N)
+                bias_mask = (start_n + offs_kv) < seqlen_k
+                bias = tl.load(
+                    bias_base_ptrs + (start_n + offs_kv) * stride_bn,
+                    mask=bias_mask,
+                    other=0.0,
+                )[None, :]
                 qk_scaled += bias
 
             m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
@@ -479,8 +493,15 @@ def _sage_fwd_blocksparse_mask(
                 )
                 qk_scaled += alibi_block
             if USE_BIAS:
-                bias_ptrs = bias_base_ptrs + start_n * stride_bn
-                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
+                # delta_s: one value per K position, shared by every Q row
+                # in this block, so the load is 1-D along N.
+                offs_kv = tl.arange(0, BLOCK_N)
+                bias_mask = (start_n + offs_kv) < seqlen_k
+                bias = tl.load(
+                    bias_base_ptrs + (start_n + offs_kv) * stride_bn,
+                    mask=bias_mask,
+                    other=0.0,
+                )[None, :]
                 qk_scaled += bias
             qk_scaled = tl.where(
                 qk_mask, qk_scaled, float("-inf")
@@ -770,8 +791,15 @@ def _sage_fwd_mask(
 
         # compute bias
         if USE_BIAS:
-            bias_ptrs = bias_base_ptrs + start_n * stride_bn
-            bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
+            # delta_s: one value per K position, shared by every Q row in
+            # this block, so the load is 1-D along N.
+            offs_kv = tl.arange(0, BLOCK_N)
+            bias_mask = (start_n + offs_kv) < seqlen_k
+            bias = tl.load(
+                bias_base_ptrs + (start_n + offs_kv) * stride_bn,
+                mask=bias_mask,
+                other=0.0,
+            )[None, :]
             qk += bias
 
         # get max scores so far
@@ -1487,14 +1515,9 @@ def sage_fwd(
     q_descale = tl.load(q_descale_ptr)  # MHA: use q head index
 
     if USE_BIAS:
-        # Note: this might get large enough to overflow on some configs
-        bias_offset = off_h_q * stride_bh
-        bias_ptrs = (
-            bias
-            + bias_offset
-            + offs_m[:, None] * stride_bm
-            + offs_n[None, :] * stride_bn
-        )
+        # bias is delta_s, laid out [batch, heads, Q_blocks, seqlen_k]: one row
+        # per Q block rather than per Q row.
+        bias_ptrs = bias + off_z * stride_bz + off_h_q * stride_bh + start_m * stride_bm
     else:
         bias_ptrs = None
 

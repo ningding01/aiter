@@ -13,6 +13,7 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     _rotate_quantize_q_kernel,
     _rotate_quantize_k_kernel,
     _compute_delta_s_kernel,
+    _q_smooth_int8_kernel,
 )
 
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
@@ -196,6 +197,85 @@ def sage_quant_mxfp4(
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
 
 
+def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
+    """Center Q per BLKQ block and build the delta_s bias that undoes the shift.
+
+    SmoothQ: subtracting the block mean m_b from Q shrinks the INT8 dynamic
+    range that outlier rows would otherwise dominate. The dropped term
+    m_b . K_j is a per-(q_block, k_position) constant, so it is added back as a
+    bias inside the attention kernel rather than being lost. sm_scale is folded
+    into Q here (in log2 units), which is why the quant kernel is called with
+    scale 1.0 on this path.
+    """
+    bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+    b, s_q, h_q, d = map_dims(q.shape, bshd)
+    _, s_k, h_k, _ = map_dims(k.shape, bshd)
+
+    Q_NUM_BLKS = (s_q + BLKQ - 1) // BLKQ
+    K_NUM_BLKS = (s_k + BLKQ - 1) // BLKQ
+
+    q_mean = torch.empty((b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device)
+    delta_s = torch.empty(
+        (b, h_q, Q_NUM_BLKS, s_k), dtype=torch.float32, device=q.device
+    )
+    q_out = torch.empty_like(q)
+
+    stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
+    stride_qob, stride_qom, stride_qoh, stride_qod = map_dims(q_out.stride(), bshd)
+    stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
+
+    sm_scale_log2 = sm_scale * 1.4426950408889634
+    grid_q = (b * h_q, Q_NUM_BLKS, triton.cdiv(d, 32))
+    _q_smooth_int8_kernel[grid_q](
+        q,
+        q_out,
+        q_mean,
+        sm_scale_log2,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_qd,
+        stride_qob,
+        stride_qoh,
+        stride_qom,
+        stride_qod,
+        q_mean.stride(0),
+        q_mean.stride(1),
+        q_mean.stride(2),
+        q_mean.stride(3),
+        h_q,
+        s_q,
+        d,
+        BLOCK_M=BLKQ,
+        BLOCK_D=32,
+    )
+
+    grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
+    _compute_delta_s_kernel[grid_delta](
+        q_mean,
+        k,
+        delta_s,
+        q_mean.stride(0),
+        q_mean.stride(1),
+        q_mean.stride(2),
+        q_mean.stride(3),
+        stride_kb,
+        stride_kh,
+        stride_kn,
+        stride_kd,
+        delta_s.stride(0),
+        delta_s.stride(1),
+        delta_s.stride(2),
+        delta_s.stride(3),
+        h_q,
+        h_k,
+        s_k,
+        d,
+        BLOCK_N=BLKQ,
+    )
+    return q_out, delta_s
+
+
 def sage_quant(
     q,
     k,
@@ -207,7 +287,11 @@ def sage_quant(
     sm_scale=None,
     layout="bshd",
     smooth_k=True,
+    q_smoothing=False,
     return_lse=False,
+    hadamard_rotation=False,
+    R=None,
+    BLOCK_R=None,
 ):
     """
     Quantize Q and K tensors to INT8 with per-block scaling.
@@ -223,8 +307,14 @@ def sage_quant(
         sm_scale: Softmax scale factor (defaults to head_dim^-0.5)
         layout: Either "bshd" or "bhsd"
         smooth_k: Whether to apply SageAttention-style smoothing to K tensor (default: True)
+        q_smoothing: Center Q per block and return the delta_s bias that undoes
+            the shift inside the attention kernel (SmoothQ, default: False)
         return_lse: If True, additionally return a per-query-row LSE correction
             term that compensates for K smoothing (default: False)
+        hadamard_rotation: Rotate Q/K by a normalized Hadamard matrix before
+            INT8 quantization
+        R: Optional pre-built Hadamard matrix (BLOCK_R x BLOCK_R)
+        BLOCK_R: Hadamard tile size; required when hadamard_rotation=True and R is None
     Returns:
         q_int8: Quantized Q tensor
         q_scale: Per-block scales for Q
@@ -232,6 +322,8 @@ def sage_quant(
         k_scale: Per-block scales for K
         v_fp8: Quantized V tensor
         v_scale: Per-(B,H,D) scales for V
+        delta_s (only when q_smoothing=True): float32 (B, H_q, Q_blocks, S_k)
+            bias added to the scaled qk scores by the attention kernel.
         delta_lse (only when return_lse=True): float32 (B, H_q, S_q) tensor;
             add it to the attention kernel's softmax_lse to recover the LSE
             that would be produced for un-smoothed K. Required for correct
@@ -259,21 +351,57 @@ def sage_quant(
     Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
+    q_orig = q
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+
     # Apply K tensor smoothing following SageAttention approach.
     # Retain k_mean so we can compute the LSE correction when return_lse=True.
+    # Order matters: the Hadamard rotation runs first (it mixes head_dim), then
+    # K smoothing, then Q centering -- delta_s must be built against the K that
+    # the kernel will actually see.
+    delta_s = None
+    k_mean = None  # feeds the return_lse correction, always in un-rotated space
+    if hadamard_rotation:
+        if R is None:
+            assert (
+                BLOCK_R is not None
+            ), "if using hadamard rotation, BLOCK_R must be provided when R is None"
+            R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (
+                BLOCK_R**0.5
+            )
+        else:
+            BLOCK_R = R.shape[-1]
+        if head_dim % BLOCK_R != 0:
+            raise ValueError(
+                f"head_dim ({head_dim}) must be divisible by BLOCK_R ({BLOCK_R})"
+            )
+        if return_lse and smooth_k:
+            k_mean = k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+        q, k, _ = rotation_smooth_qk(
+            q,
+            k,
+            BLKQ,
+            R=R,
+            BLOCK_R=BLOCK_R,
+            q_smoothing=False,
+            sm_scale=None,
+            layout=layout,
+            smooth_k=False,
+        )
+
     if smooth_k:
-        k_mean = k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
-        k = k - k_mean
-    else:
-        k_mean = None
+        k_mean_cur = k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+        k = k - k_mean_cur
+        if k_mean is None:
+            k_mean = k_mean_cur
+    if q_smoothing:
+        q, delta_s = _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale)
 
     q_scale = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((b, h_kv, K_NUM_BLKS), device=q.device, dtype=torch.float32)
 
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
-
-    if sm_scale is None:
-        sm_scale = head_dim**-0.5
 
     q_task_count = b * h_qo * Q_NUM_BLKS
     k_task_count = b * h_kv * K_NUM_BLKS
@@ -304,7 +432,9 @@ def sage_quant(
         k_scale.stride(1),
         v_scale.stride(0),
         v_scale.stride(1),
-        (sm_scale * 1.4426950408889634),
+        # SmoothQ already folded sm_scale (in log2 units) into Q, so the quant
+        # kernel must not apply it a second time.
+        (1.0 if q_smoothing else (sm_scale * 1.4426950408889634)),
         q_task_count,
         k_task_count,
         b,
@@ -324,22 +454,29 @@ def sage_quant(
         num_warps=8,
     )
 
+    out = [q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale]
+    if q_smoothing:
+        out.append(delta_s)
+
     if not return_lse:
-        return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale
+        return tuple(out)
 
     # K-smoothing shifts every qk_ij by a row-wise constant
     #     delta_i = sm_scale * Q_i . k_mean^T
     # so the kernel's softmax_lse is offset by -delta_i relative to the LSE
     # an un-smoothed K would produce. Return delta so the caller can add it
-    # back.
+    # back. q_orig is used rather than q because Q may have been rotated and
+    # centered above.
     if k_mean is None:
-        delta_lse = torch.zeros((b, h_qo, qo_len), device=q.device, dtype=torch.float32)
+        delta_lse = torch.zeros(
+            (b, h_qo, qo_len), device=q_orig.device, dtype=torch.float32
+        )
     else:
         if layout == "bhsd":
-            q_bhsd = q
+            q_bhsd = q_orig
             kmean_bhsd = k_mean
         else:  # bshd
-            q_bhsd = q.transpose(1, 2)
+            q_bhsd = q_orig.transpose(1, 2)
             kmean_bhsd = k_mean.transpose(1, 2)
 
         if h_qo != h_kv:
@@ -352,7 +489,8 @@ def sage_quant(
             dim=-1
         ) * sm_scale
 
-    return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, delta_lse
+    out.append(delta_lse)
+    return tuple(out)
 
 
 def rotation_smooth_qk(
@@ -364,6 +502,7 @@ def rotation_smooth_qk(
     q_smoothing=False,
     sm_scale=None,
     layout="bhsd",
+    smooth_k=True,
 ):
 
     if R is None:  # Generate Hadamard Matrix R if not given
@@ -457,7 +596,8 @@ def rotation_smooth_qk(
     )
 
     # smooth k
-    K_rot = K_rot - K_rot.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+    if smooth_k:
+        K_rot = K_rot - K_rot.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
     if q_smoothing:
         # compute delta s that needs to be added due to q smoothing
